@@ -12,7 +12,7 @@ paths:
       tags:
         - Applications
       summary: 'Execute command'
-      description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.'
+      description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The command payload is not sent until a per-request stdin-only supervisor handshake is observed. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.'
       operationId: execute-command-in-application
       parameters:
         -
@@ -9784,7 +9784,7 @@ paths:
       tags:
         - Servers
       summary: 'Execute command'
-      description: 'Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist on the target server; otherwise the shell script is not started.'
+      description: 'Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. The command payload is not sent until a per-request stdin-only supervisor handshake is observed. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist on the target server; otherwise the shell script is not started.'
       operationId: execute-command-on-server
       parameters:
         -
@@ -15005,7 +15005,7 @@ components:
         stderr_truncated:
           type: boolean
         timed_out:
-          description: 'True only when a remote timeout supervisor marker was observed without controlled-shell completion, or the bounded local SSH watchdog expired.'
+          description: 'True only when the correlated remote supervisor result arrives at or beyond the deadline measured from its per-request staged handshake, or the bounded local SSH watchdog expires.'
           type: boolean
       type: object
   responses:

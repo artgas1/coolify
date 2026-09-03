@@ -28,7 +28,7 @@ uses(RefreshDatabase::class);
 
 class CapturingTerminalCommandProcessRunner extends TerminalCommandProcessRunner
 {
-    /** @var array<int, array{argv: array<int, string>, stdin: string, timeout: int, connectionTimeout: int, timeoutMarker: string, completionMarker: string}> */
+    /** @var array<int, array{argv: array<int, string>, stdin: string, timeout: int, connectionTimeout: int, timeoutMarker: string, startMarker: string}> */
     public array $calls = [];
 
     /** @var array{exit_code: int, stdout: string, stderr: string, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool} */
@@ -52,9 +52,9 @@ class CapturingTerminalCommandProcessRunner extends TerminalCommandProcessRunner
         int $timeout,
         int $connectionTimeout = 0,
         string $timeoutMarker = '',
-        string $completionMarker = '',
+        string $startMarker = '',
     ): array {
-        $this->calls[] = compact('argv', 'stdin', 'timeout', 'connectionTimeout', 'timeoutMarker', 'completionMarker');
+        $this->calls[] = compact('argv', 'stdin', 'timeout', 'connectionTimeout', 'timeoutMarker', 'startMarker');
         if (! is_null($this->exceptionMessage)) {
             throw new RuntimeException($this->exceptionMessage);
         }
@@ -202,21 +202,21 @@ test('server exec uses static ssh argv stdin and persists a redacted correlated 
 
     expect($this->runner->calls)->toHaveCount(1);
     $call = $this->runner->calls[0];
+    [$timeoutFrame, $script] = explode("\n", $call['stdin'], 2);
     expect($call['argv'])->toContain('ConnectTimeout=10')
         ->and($call['argv'][array_key_last($call['argv'])])->toContain('timeout --preserve-status -k 1s 4s sh -c')
-        ->and($call['argv'][array_key_last($call['argv'])])->toContain('sh -s; status=$?; printf', 'case "$status" in 137|143)')
+        ->and($call['argv'][array_key_last($call['argv'])])->toContain('terminal_timed_out=0', 'terminal_script=$(cat; printf x)', '3>&- 4>&- 5>&- 6>&-', 'while :; do sleep 1; done')
         ->and(implode(' ', $call['argv']))->not->toContain($command)
-        ->and($call['stdin'])->toBe($command."\n")
+        ->and($timeoutFrame)->toMatch('/^__COOLIFY_TERMINAL_FRAME_[0-9a-f]{64}__$/')
+        ->and($script)->toBe($command."\n")
         ->and($call['timeout'])->toBe(4)
         ->and($call['connectionTimeout'])->toBe(10)
-        ->and($call['timeoutMarker'])->toMatch('/^__COOLIFY_TERMINAL_TIMEOUT_[0-9a-f]{64}__$/')
-        ->and($call['completionMarker'])->toMatch('/^__COOLIFY_TERMINAL_COMPLETE_[0-9a-f]{64}__$/')
-        ->and($call['argv'][array_key_last($call['argv'])])->toContain($call['timeoutMarker'])
-        ->and($call['argv'][array_key_last($call['argv'])])->toContain($call['completionMarker'])
+        ->and($call['timeoutMarker'])->toBe($timeoutFrame.':timeout')
+        ->and($call['startMarker'])->toBe($timeoutFrame.':start')
+        ->and(implode(' ', $call['argv']))->not->toContain($timeoutFrame)
         ->and(TerminalCommandProcessRunner::localProcessTimeoutSeconds(4, 10))->toBe(17);
 
     $leaseMethod = new ReflectionMethod(TerminalCommandService::class, 'concurrencyLeaseSeconds');
-    $leaseMethod->setAccessible(true);
     expect($leaseMethod->invoke(resolve(TerminalCommandService::class), 4, 10))->toBe(18);
 
     $audit = AuditEvent::query()->findOrFail($response->json('audit_event_id'));
@@ -530,10 +530,13 @@ test('application exec resolves a running container and shares the stdin executi
         ->assertOk();
 
     $call = $this->runner->calls[0];
+    [$timeoutFrame, $script] = explode("\n", $call['stdin'], 2);
     expect($call['argv'][array_key_last($call['argv'])])
         ->toContain("docker exec -i 'app-container' sh -c", 'timeout --preserve-status -k 1s 10s sh -c')
         ->and(implode(' ', $call['argv']))->not->toContain($command)
-        ->and($call['stdin'])->toBe($command."\n");
+        ->and(implode(' ', $call['argv']))->not->toContain($timeoutFrame)
+        ->and($timeoutFrame)->toMatch('/^__COOLIFY_TERMINAL_FRAME_[0-9a-f]{64}__$/')
+        ->and($script)->toBe($command."\n");
 
     $audit = AuditEvent::query()->findOrFail($response->json('audit_event_id'));
     expect($audit)

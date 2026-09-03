@@ -88,19 +88,19 @@ test('terminal process runner watchdog includes connection remote kill and emerg
 });
 
 test('missing remote timeout fails before the stdin shell script starts', function () {
-    $marker = '__COOLIFY_TERMINAL_TIMEOUT_'.str_repeat('a', 64).'__';
-    $completionMarker = '__COOLIFY_TERMINAL_COMPLETE_'.str_repeat('a', 64).'__';
-    $controlledShell = 'sh -s; status=$?; printf "\\n%s\\n" "'.$completionMarker.'" >&2; exit "$status"';
-    $wrapper = 'PATH=/definitely-missing; timeout --preserve-status -k 1s 1s sh -c '
-        .escapeshellarg($controlledShell).'; status=$?; '
-        .'case "$status" in 137|143) printf "\\n%s\\n" "'.$marker.'" >&2;; esac; exit "$status"';
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('a', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $wrapper = 'IFS= read -r frame || exit 125; printf "\\n%s:start\\n" "$frame" >&2; '
+        .'script=$(cat; printf x); script=${script%x}; PATH=/definitely-missing; '
+        .'printf "%s" "$script" | timeout --preserve-status -k 1s 1s sh -s';
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         ['/bin/sh', '-c', $wrapper],
-        "printf 'payload-must-not-run'\n",
+        $frame."\nprintf 'payload-must-not-run'\n",
         1,
         0,
         $marker,
-        $completionMarker,
+        $startMarker,
     );
 
     expect($result)
@@ -109,63 +109,92 @@ test('missing remote timeout fails before the stdin shell script starts', functi
         ->stdout->not->toContain('payload-must-not-run');
 });
 
-test('ordinary terminal exit statuses are not identified as timeouts when completion is observed', function (int $status) {
-    $marker = '__COOLIFY_TERMINAL_TIMEOUT_'.str_repeat('b', 64).'__';
-    $completionMarker = '__COOLIFY_TERMINAL_COMPLETE_'.str_repeat('b', 64).'__';
-    $framedCompletionMarker = "\n{$completionMarker}\n";
-    $framedTimeoutMarker = in_array($status, [137, 143], true) ? "\n{$marker}\n" : '';
-    $script = 'fwrite(STDERR, '.var_export($framedCompletionMarker.$framedTimeoutMarker, true).'); exit('.$status.');';
+test('terminal process runner sends only the frame until it observes the remote start marker', function () {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('b', 64).'__';
+    $startMarker = $frame.':start';
+    $script = '$frame = fgets(STDIN); stream_set_blocking(STDIN, false); '
+        .'$premature = stream_get_contents(STDIN); '
+        .'fwrite(STDERR, '.var_export("\n{$startMarker}\n", true).'); fflush(STDERR); '
+        .'stream_set_blocking(STDIN, true); $payload = stream_get_contents(STDIN); '
+        .'fwrite(STDOUT, ($premature === "" ? "staged:" : "premature:").$payload);';
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         [PHP_BINARY, '-r', $script],
-        '',
+        $frame."\npayload-after-start\n",
+        1,
+        1,
+        $frame.':timeout',
+        $startMarker,
+    );
+
+    expect($result)
+        ->exit_code->toBe(0)
+        ->timed_out->toBeFalse()
+        ->stdout->toBe("staged:payload-after-start\n")
+        ->stderr->not->toContain($startMarker);
+});
+
+test('ordinary terminal exit statuses are not identified as timeouts before the deadline', function (int $status) {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('c', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $framedMarkers = "\n{$startMarker}\n".(in_array($status, [137, 143], true) ? "\n{$marker}\n" : '');
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export($framedMarkers, true).'); fflush(STDERR); '
+        .'stream_get_contents(STDIN); exit('.$status.');';
+    $result = resolve(TerminalCommandProcessRunner::class)->run(
+        [PHP_BINARY, '-r', $script],
+        $frame."\nexit {$status}\n",
         1,
         1,
         $marker,
-        $completionMarker,
+        $startMarker,
     );
 
     expect($result)
         ->exit_code->toBe($status)
         ->timed_out->toBeFalse()
-        ->stderr->not->toContain($marker, $completionMarker);
+        ->stderr->not->toContain($marker, $startMarker);
 })->with([124, 137, 143]);
 
-test('remote supervisor marker identifies term and kill statuses and is stripped', function (int $status) {
-    $marker = '__COOLIFY_TERMINAL_TIMEOUT_'.str_repeat('c', 64).'__';
-    $completionMarker = '__COOLIFY_TERMINAL_COMPLETE_'.str_repeat('c', 64).'__';
-    $framedMarker = "\n{$marker}\n";
-    $script = 'fwrite(STDERR, '.var_export($framedMarker, true).'); exit('.$status.');';
+test('remote timeout marker after the supervised deadline normalizes term and kill statuses', function (int $status) {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('d', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export("\n{$startMarker}\n", true).'); fflush(STDERR); '
+        .'stream_get_contents(STDIN); usleep(1100000); '
+        .'fwrite(STDERR, '.var_export("\n{$marker}\n", true).'); exit('.$status.');';
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         [PHP_BINARY, '-r', $script],
-        '',
+        $frame."\nsleep beyond deadline\n",
         1,
         1,
         $marker,
-        $completionMarker,
+        $startMarker,
     );
 
     expect($result)
         ->exit_code->toBe(124)
         ->timed_out->toBeTrue()
-        ->stderr->not->toContain($marker);
+        ->stderr->not->toContain($marker, $startMarker);
 })->with([137, 143]);
 
-test('remote timeout marker is detected across stream chunks beyond the stderr cap', function () {
-    $marker = '__COOLIFY_TERMINAL_TIMEOUT_'.str_repeat('d', 64).'__';
-    $completionMarker = '__COOLIFY_TERMINAL_COMPLETE_'.str_repeat('d', 64).'__';
+test('remote start and timeout markers are detected across stream chunks beyond the stderr cap', function () {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('e', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
     $framedMarker = "\n{$marker}\n";
     $firstHalf = substr($framedMarker, 0, 40);
     $secondHalf = substr($framedMarker, 40);
-    $script = 'fwrite(STDERR, str_repeat("x", 70000)); '
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export("\n{$startMarker}\n", true).'); fflush(STDERR); '
+        .'stream_get_contents(STDIN); fwrite(STDERR, str_repeat("x", 70000)); usleep(1050000); '
         .'fwrite(STDERR, '.var_export($firstHalf, true).'); usleep(50000); '
         .'fwrite(STDERR, '.var_export($secondHalf, true).'); exit(143);';
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         [PHP_BINARY, '-r', $script],
-        '',
+        $frame."\nlarge timeout output\n",
         1,
         1,
         $marker,
-        $completionMarker,
+        $startMarker,
     );
 
     expect($result)
@@ -174,32 +203,71 @@ test('remote timeout marker is detected across stream chunks beyond the stderr c
         ->stderr_bytes->toBe(70_000)
         ->stderr_truncated->toBeTrue()
         ->and(strlen($result['stderr']))->toBe(TerminalCommandProcessRunner::OUTPUT_LIMIT_BYTES)
-        ->and($result['stderr'])->not->toContain($marker);
+        ->and($result['stderr'])->not->toContain($marker, $startMarker);
 });
 
-test('split completion marker beyond the stderr cap prevents an ordinary 143 exit from becoming a timeout', function () {
-    $marker = '__COOLIFY_TERMINAL_TIMEOUT_'.str_repeat('e', 64).'__';
-    $completionMarker = '__COOLIFY_TERMINAL_COMPLETE_'.str_repeat('e', 64).'__';
-    $framedCompletionMarker = "\n{$completionMarker}\n";
-    $firstHalf = substr($framedCompletionMarker, 0, 40);
-    $secondHalf = substr($framedCompletionMarker, 40);
-    $framedTimeoutMarker = "\n{$marker}\n";
-    $script = 'fwrite(STDERR, str_repeat("x", 70000)); '
-        .'fwrite(STDERR, '.var_export($firstHalf, true).'); usleep(50000); '
-        .'fwrite(STDERR, '.var_export($secondHalf.$framedTimeoutMarker, true).'); exit(143);';
+test('an early timeout marker cannot become a timeout because process teardown crosses the deadline', function () {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('f', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export("\n{$startMarker}\n", true).'); fflush(STDERR); '
+        .'stream_get_contents(STDIN); fwrite(STDERR, '.var_export("\n{$marker}\n", true).'); fflush(STDERR); '
+        .'usleep(1100000); exit(137);';
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         [PHP_BINARY, '-r', $script],
-        '',
+        $frame."\nearly marker then slow teardown\n",
         1,
         1,
         $marker,
-        $completionMarker,
+        $startMarker,
+    );
+
+    expect($result)
+        ->exit_code->toBe(137)
+        ->timed_out->toBeFalse()
+        ->duration_ms->toBeGreaterThanOrEqual(1_000)
+        ->stderr->not->toContain($marker, $startMarker);
+});
+
+test('a later qualifying timeout marker wins over an earlier forged marker', function () {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('1', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export("\n{$startMarker}\n", true).'); fflush(STDERR); '
+        .'stream_get_contents(STDIN); fwrite(STDERR, '.var_export("\n{$marker}\n", true).'); fflush(STDERR); '
+        .'usleep(1100000); fwrite(STDERR, '.var_export("\n{$marker}\n", true).'); fflush(STDERR); exit(137);';
+    $result = resolve(TerminalCommandProcessRunner::class)->run(
+        [PHP_BINARY, '-r', $script],
+        $frame."\nearly and late markers\n",
+        1,
+        1,
+        $marker,
+        $startMarker,
+    );
+
+    expect($result)
+        ->exit_code->toBe(124)
+        ->timed_out->toBeTrue()
+        ->stderr->not->toContain($marker, $startMarker);
+});
+
+test('coalesced start and timeout markers cannot claim a deadline that did not elapse', function () {
+    $frame = '__COOLIFY_TERMINAL_FRAME_'.str_repeat('2', 64).'__';
+    $marker = $frame.':timeout';
+    $startMarker = $frame.':start';
+    $script = 'fgets(STDIN); fwrite(STDERR, '.var_export("\n{$startMarker}\n\n{$marker}\n", true).'); '
+        .'fflush(STDERR); stream_get_contents(STDIN); exit(143);';
+    $result = resolve(TerminalCommandProcessRunner::class)->run(
+        [PHP_BINARY, '-r', $script],
+        $frame."\ncoalesced markers\n",
+        1,
+        1,
+        $marker,
+        $startMarker,
     );
 
     expect($result)
         ->exit_code->toBe(143)
         ->timed_out->toBeFalse()
-        ->stderr_bytes->toBe(70_000)
-        ->stderr_truncated->toBeTrue()
-        ->and($result['stderr'])->not->toContain($marker, $completionMarker);
+        ->stderr->not->toContain($marker, $startMarker);
 });

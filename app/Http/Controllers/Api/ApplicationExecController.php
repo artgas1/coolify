@@ -19,7 +19,7 @@ class ApplicationExecController extends Controller
 {
     #[OA\Post(
         summary: 'Execute command',
-        description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.',
+        description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The command payload is not sent until a per-request stdin-only supervisor handshake is observed. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.',
         path: '/applications/{uuid}/exec',
         operationId: 'execute-command-in-application',
         security: [['bearerAuth' => []]],

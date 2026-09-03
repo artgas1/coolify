@@ -32,7 +32,7 @@ use Throwable;
         new OA\Property(property: 'audit_event_id', type: 'integer'),
         new OA\Property(property: 'stdout_truncated', type: 'boolean'),
         new OA\Property(property: 'stderr_truncated', type: 'boolean'),
-        new OA\Property(property: 'timed_out', description: 'True only when a remote timeout supervisor marker was observed without controlled-shell completion, or the bounded local SSH watchdog expired.', type: 'boolean'),
+        new OA\Property(property: 'timed_out', description: 'True only when the correlated remote supervisor result arrives at or beyond the deadline measured from its per-request staged handshake, or the bounded local SSH watchdog expires.', type: 'boolean'),
     ],
 )]
 class TerminalCommandService
@@ -130,24 +130,20 @@ class TerminalCommandService
             );
 
             try {
-                [$timeoutMarker, $completionMarker] = $this->timeoutMarkers();
+                $timeoutFrame = $this->timeoutFrame();
+                $timeoutMarker = $timeoutFrame.':timeout';
+                $startMarker = $timeoutFrame.':start';
                 $this->refreshConcurrencySlot($lock, $auditEvent, $timeout, $connectionTimeout);
-                $remoteCommand = $this->remoteCommand(
-                    server: $server,
-                    container: $container,
-                    timeout: $timeout,
-                    timeoutMarker: $timeoutMarker,
-                    completionMarker: $completionMarker,
-                );
+                $remoteCommand = $this->remoteCommand($server, $container, $timeout);
                 $argv = SshMultiplexingHelper::generateSshStdinCommand($server, $remoteCommand, $connectionTimeout);
                 $this->refreshConcurrencySlot($lock, $auditEvent, $timeout, $connectionTimeout);
                 $result = $this->processRunner->run(
                     argv: $argv,
-                    stdin: $command."\n",
+                    stdin: $timeoutFrame."\n".$command."\n",
                     timeout: $timeout,
                     connectionTimeout: $connectionTimeout,
                     timeoutMarker: $timeoutMarker,
-                    completionMarker: $completionMarker,
+                    startMarker: $startMarker,
                 );
                 $outcome = match (true) {
                     $result['timed_out'] => 'timed_out',
@@ -292,30 +288,27 @@ class TerminalCommandService
         );
     }
 
-    /**
-     * @return array{string, string}
-     */
-    private function timeoutMarkers(): array
+    private function timeoutFrame(): string
     {
-        return [
-            '__COOLIFY_TERMINAL_TIMEOUT_'.bin2hex(random_bytes(32)).'__',
-            '__COOLIFY_TERMINAL_COMPLETE_'.bin2hex(random_bytes(32)).'__',
-        ];
+        return '__COOLIFY_TERMINAL_FRAME_'.bin2hex(random_bytes(32)).'__';
     }
 
-    private function remoteCommand(
-        Server $server,
-        ?string $container,
-        int $timeout,
-        string $timeoutMarker,
-        string $completionMarker,
-    ): string {
+    private function remoteCommand(Server $server, ?string $container, int $timeout): string
+    {
         $killGrace = TerminalCommandProcessRunner::REMOTE_KILL_GRACE_SECONDS;
-        $controlledShell = 'sh -s; status=$?; printf "\\n%s\\n" "'.$completionMarker.'" >&2; exit "$status"';
-        $supervisedShell = 'timeout --preserve-status -k '.$killGrace.'s '.$timeout.'s sh -c '
-            .escapeshellarg($controlledShell).'; status=$?; '
-            .'case "$status" in 137|143) printf "\\n%s\\n" "'.$timeoutMarker.'" >&2;; esac; '
+        $controlledShell = 'terminal_timed_out=0; trap \'terminal_timed_out=1\' TERM; '
+            .'sh -s; status=$?; '
+            .'if [ "$terminal_timed_out" -eq 1 ]; then trap "" TERM; while :; do sleep 1; done; fi; '
             .'exit "$status"';
+        $supervisedShell = 'IFS= read -r terminal_frame || exit 125; '
+            .'printf "\\n%s:start\\n" "$terminal_frame" >&2; '
+            .'terminal_script=$(cat; printf x); terminal_script=${terminal_script%x}; '
+            .'printf "%s" "$terminal_script" | '
+            .'timeout --preserve-status -k '.$killGrace.'s '.$timeout.'s sh -c '
+            .escapeshellarg($controlledShell).' 3>&- 4>&- 5>&- 6>&-; terminal_status=$?; '
+            .'case "$terminal_status" in 137|143) '
+            .'printf "\\n%s:timeout\\n" "$terminal_frame" >&2;; esac; '
+            .'exit "$terminal_status"';
         if (is_null($container)) {
             return $supervisedShell;
         }

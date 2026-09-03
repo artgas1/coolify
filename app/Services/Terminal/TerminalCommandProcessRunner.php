@@ -3,6 +3,7 @@
 namespace App\Services\Terminal;
 
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
+use Symfony\Component\Process\InputStream;
 use Symfony\Component\Process\Process;
 
 class TerminalCommandProcessRunner
@@ -25,23 +26,37 @@ class TerminalCommandProcessRunner
         int $timeout,
         int $connectionTimeout = 0,
         string $timeoutMarker = '',
-        string $completionMarker = '',
+        string $startMarker = '',
     ): array {
         $stdout = '';
         $stderr = '';
         $stdoutBytes = 0;
         $stderrBytes = 0;
         $stderrPending = '';
-        $timeoutMarkerDetected = false;
-        $completionMarkerDetected = false;
+        $timeoutMarkerDetectedAt = [];
+        $startMarkerDetectedAt = null;
+        $payloadSent = false;
         $localWatchdogExpired = false;
         $process = new Process($argv);
-        $process->setInput($stdin);
+        $inputStream = null;
+        $payload = '';
+        if ($startMarker !== '') {
+            $frameSeparator = strpos($stdin, "\n");
+            if ($frameSeparator === false) {
+                throw new \InvalidArgumentException('Staged terminal input requires a correlation frame line.');
+            }
+            $inputStream = new InputStream;
+            $inputStream->write(substr($stdin, 0, $frameSeparator + 1));
+            $payload = substr($stdin, $frameSeparator + 1);
+            $process->setInput($inputStream);
+        } else {
+            $process->setInput($stdin);
+        }
         $process->setTimeout(self::localProcessTimeoutSeconds($timeout, $connectionTimeout));
         $startedAt = hrtime(true);
 
         try {
-            $process->run(function (string $type, string $chunk) use ($process, $timeoutMarker, $completionMarker, &$stdout, &$stderr, &$stdoutBytes, &$stderrBytes, &$stderrPending, &$timeoutMarkerDetected, &$completionMarkerDetected): void {
+            $process->run(function (string $type, string $chunk) use ($process, $inputStream, $payload, $timeoutMarker, $startMarker, &$payloadSent, &$stdout, &$stderr, &$stdoutBytes, &$stderrBytes, &$stderrPending, &$timeoutMarkerDetectedAt, &$startMarkerDetectedAt): void {
                 if ($type === Process::OUT) {
                     $this->captureChunk($stdout, $stdoutBytes, $chunk);
                     $process->clearOutput();
@@ -54,24 +69,43 @@ class TerminalCommandProcessRunner
                     totalBytes: $stderrBytes,
                     chunk: $chunk,
                     timeoutMarker: $timeoutMarker,
-                    completionMarker: $completionMarker,
+                    startMarker: $startMarker,
                     pending: $stderrPending,
-                    timeoutMarkerDetected: $timeoutMarkerDetected,
-                    completionMarkerDetected: $completionMarkerDetected,
+                    timeoutMarkerDetectedAt: $timeoutMarkerDetectedAt,
+                    startMarkerDetectedAt: $startMarkerDetectedAt,
                 );
+                if ($startMarkerDetectedAt !== null && ! $payloadSent && $inputStream !== null) {
+                    $inputStream->write($payload);
+                    $inputStream->close();
+                    $payloadSent = true;
+                }
                 $process->clearErrorOutput();
             });
             $exitCode = $process->getExitCode() ?? 1;
         } catch (ProcessTimedOutException) {
             $exitCode = 124;
             $localWatchdogExpired = true;
+        } finally {
+            if ($inputStream !== null && ! $inputStream->isClosed()) {
+                $inputStream->close();
+            }
         }
 
         if ($stderrPending !== '') {
             $this->captureChunk($stderr, $stderrBytes, $stderrPending);
         }
 
-        $remoteTimeoutDetected = $timeoutMarkerDetected && ! $completionMarkerDetected;
+        $finishedAt = hrtime(true);
+        $remoteTimeoutDetected = false;
+        if ($startMarkerDetectedAt !== null && in_array($exitCode, [137, 143], true)) {
+            $deadline = $startMarkerDetectedAt + ($timeout * 1_000_000_000);
+            foreach ($timeoutMarkerDetectedAt as $detectedAt) {
+                if ($detectedAt >= $deadline) {
+                    $remoteTimeoutDetected = true;
+                    break;
+                }
+            }
+        }
         $timedOut = $remoteTimeoutDetected || $localWatchdogExpired;
         if ($remoteTimeoutDetected) {
             $exitCode = 124;
@@ -87,7 +121,7 @@ class TerminalCommandProcessRunner
             'exit_code' => $exitCode,
             'stdout' => $this->formatOutput($stdout, $stdoutTruncated),
             'stderr' => $this->formatOutput($stderr, $stderrTruncated),
-            'duration_ms' => max(0, (int) round((hrtime(true) - $startedAt) / 1_000_000)),
+            'duration_ms' => max(0, (int) round(($finishedAt - $startedAt) / 1_000_000)),
             'stdout_bytes' => $stdoutBytes,
             'stderr_bytes' => $stderrBytes,
             'stdout_truncated' => $stdoutTruncated,
@@ -109,48 +143,51 @@ class TerminalCommandProcessRunner
         return self::localProcessTimeoutSeconds($remoteTimeout, $connectionTimeout);
     }
 
+    /**
+     * @param  array<int, int>  $timeoutMarkerDetectedAt
+     */
     private function captureStderrChunk(
         string &$buffer,
         int &$totalBytes,
         string $chunk,
         string $timeoutMarker,
-        string $completionMarker,
+        string $startMarker,
         string &$pending,
-        bool &$timeoutMarkerDetected,
-        bool &$completionMarkerDetected,
+        array &$timeoutMarkerDetectedAt,
+        ?int &$startMarkerDetectedAt,
     ): void {
-        if ($timeoutMarker === '' && $completionMarker === '') {
+        if ($timeoutMarker === '' && $startMarker === '') {
             $this->captureChunk($buffer, $totalBytes, $chunk);
 
             return;
         }
 
         $framedTimeoutMarker = $timeoutMarker === '' ? '' : "\n{$timeoutMarker}\n";
-        $framedCompletionMarker = $completionMarker === '' ? '' : "\n{$completionMarker}\n";
+        $framedStartMarker = $startMarker === '' ? '' : "\n{$startMarker}\n";
         $pending .= $chunk;
 
         while (true) {
             $timeoutPosition = $framedTimeoutMarker === '' ? false : strpos($pending, $framedTimeoutMarker);
-            $completionPosition = $framedCompletionMarker === '' ? false : strpos($pending, $framedCompletionMarker);
+            $startPosition = $framedStartMarker === '' ? false : strpos($pending, $framedStartMarker);
 
-            if ($timeoutPosition === false && $completionPosition === false) {
+            if ($timeoutPosition === false && $startPosition === false) {
                 break;
             }
 
-            $isTimeoutMarker = $completionPosition === false
-                || ($timeoutPosition !== false && $timeoutPosition <= $completionPosition);
-            $position = $isTimeoutMarker ? $timeoutPosition : $completionPosition;
-            $framedMarker = $isTimeoutMarker ? $framedTimeoutMarker : $framedCompletionMarker;
+            $isTimeoutMarker = $startPosition === false
+                || ($timeoutPosition !== false && $timeoutPosition <= $startPosition);
+            $position = $isTimeoutMarker ? $timeoutPosition : $startPosition;
+            $framedMarker = $isTimeoutMarker ? $framedTimeoutMarker : $framedStartMarker;
             $this->captureChunk($buffer, $totalBytes, substr($pending, 0, $position));
             $pending = substr($pending, $position + strlen($framedMarker));
             if ($isTimeoutMarker) {
-                $timeoutMarkerDetected = true;
-            } else {
-                $completionMarkerDetected = true;
+                $timeoutMarkerDetectedAt[] = hrtime(true);
+            } elseif ($startMarkerDetectedAt === null) {
+                $startMarkerDetectedAt = hrtime(true);
             }
         }
 
-        $retainedBytes = max(strlen($framedTimeoutMarker), strlen($framedCompletionMarker)) - 1;
+        $retainedBytes = max(strlen($framedTimeoutMarker), strlen($framedStartMarker)) - 1;
         if (strlen($pending) > $retainedBytes) {
             $flushBytes = strlen($pending) - $retainedBytes;
             $this->captureChunk($buffer, $totalBytes, substr($pending, 0, $flushBytes));
