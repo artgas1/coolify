@@ -9,7 +9,9 @@ class TerminalCommandProcessRunner
 {
     public const OUTPUT_LIMIT_BYTES = 65_536;
 
-    private const CLEANUP_GRACE_SECONDS = 1;
+    public const LOCAL_PROCESS_GRACE_SECONDS = 2;
+
+    public const CLEANUP_GRACE_SECONDS = 1;
 
     private const TRUNCATION_MARKER = "\n[... Output truncated at 65536 bytes ...]";
 
@@ -25,7 +27,7 @@ class TerminalCommandProcessRunner
         $stderrBytes = 0;
         $process = new Process($argv);
         $process->setInput($stdin);
-        $process->setTimeout($timeout);
+        $process->setTimeout(self::localProcessTimeoutSeconds($timeout));
         $startedAt = hrtime(true);
 
         try {
@@ -41,6 +43,9 @@ class TerminalCommandProcessRunner
                 $process->clearErrorOutput();
             });
             $exitCode = $process->getExitCode() ?? 1;
+            if ($exitCode === 124 && $stderrBytes === 0) {
+                $this->captureChunk($stderr, $stderrBytes, "Command timed out after {$timeout} seconds.\n");
+            }
         } catch (ProcessTimedOutException) {
             if ($process->isRunning()) {
                 $process->stop(self::CLEANUP_GRACE_SECONDS, 9);
@@ -64,6 +69,16 @@ class TerminalCommandProcessRunner
             'stdout_truncated' => $stdoutTruncated,
             'stderr_truncated' => $stderrTruncated,
         ];
+    }
+
+    public static function localProcessTimeoutSeconds(int $remoteTimeout): int
+    {
+        return $remoteTimeout + self::LOCAL_PROCESS_GRACE_SECONDS;
+    }
+
+    public static function maximumSupervisionSeconds(int $remoteTimeout): int
+    {
+        return self::localProcessTimeoutSeconds($remoteTimeout) + self::CLEANUP_GRACE_SECONDS;
     }
 
     private function captureChunk(string &$buffer, int &$totalBytes, string $chunk): void

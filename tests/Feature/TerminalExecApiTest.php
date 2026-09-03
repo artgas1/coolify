@@ -192,7 +192,7 @@ test('server exec uses static ssh argv stdin and persists a redacted correlated 
 
     expect($this->runner->calls)->toHaveCount(1);
     $call = $this->runner->calls[0];
-    expect($call['argv'])->toContain('sh -s')
+    expect($call['argv'])->toContain('timeout -k 1s 4s sh -s')
         ->and(implode(' ', $call['argv']))->not->toContain($command)
         ->and($call['stdin'])->toBe($command."\n")
         ->and($call['timeout'])->toBe(4);
@@ -453,6 +453,51 @@ test('server exec enforces the shared token and concurrency limits before audit 
         ->and(AuditEvent::query()->count())->toBe(0);
 })->with(['token', 'concurrency']);
 
+test('server exec atomically increments and admits only through each rate threshold', function (string $limit) {
+    $key = $limit === 'token'
+        ? "terminal-api-exec:token:{$this->team->id}:{$this->accessToken->id}"
+        : "terminal-api-exec:server:{$this->team->id}:{$this->server->uuid}";
+    $threshold = $limit === 'token' ? 30 : 60;
+
+    foreach (range(1, $threshold - 1) as $_) {
+        RateLimiter::increment($key, 60);
+    }
+
+    $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/servers/{$this->server->uuid}/exec", ['command' => 'whoami'])
+        ->assertOk();
+
+    expect(RateLimiter::attempts($key))->toBe($threshold)
+        ->and($this->runner->calls)->toHaveCount(1);
+
+    $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/servers/{$this->server->uuid}/exec", ['command' => 'whoami'])
+        ->assertStatus(429);
+
+    expect(RateLimiter::attempts($key))->toBe($threshold + 1)
+        ->and($this->runner->calls)->toHaveCount(1)
+        ->and(AuditEvent::query()->count())->toBe(1);
+})->with(['token', 'server']);
+
+test('server exec does not start the runner after losing its distributed concurrency slot', function () {
+    $lockKey = "terminal-api-exec:concurrent:team:{$this->team->id}:server:{$this->server->uuid}:1";
+    AuditEvent::created(function () use ($lockKey): void {
+        Cache::lock($lockKey, 20)->forceRelease();
+    });
+
+    $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/servers/{$this->server->uuid}/exec", ['command' => 'whoami'])
+        ->assertStatus(429)
+        ->assertHeader('Retry-After', '1');
+
+    expect($this->runner->calls)->toBeEmpty();
+    $metadata = AuditEvent::query()->sole()->metadata;
+    expect($metadata['outcome'])->toBe('unknown')
+        ->and($metadata['exit_code'])->toBeNull()
+        ->and($metadata['remote_process_started'])->toBeFalse()
+        ->and($metadata['not_started_reason'])->toBe('concurrency_lock_lost');
+});
+
 test('application exec resolves a running container and shares the stdin execution and audit service', function () {
     Process::fake(['*' => Process::result(output: auditedApplicationContainer())]);
     $command = 'PASSWORD=application-secret php artisan about';
@@ -462,7 +507,7 @@ test('application exec resolves a running container and shares the stdin executi
         ->assertOk();
 
     $call = $this->runner->calls[0];
-    expect($call['argv'])->toContain("docker exec -i 'app-container' sh -s")
+    expect($call['argv'])->toContain("docker exec -i 'app-container' timeout -k 1s 10s sh -s")
         ->and(implode(' ', $call['argv']))->not->toContain($command)
         ->and($call['stdin'])->toBe($command."\n");
 
@@ -562,6 +607,19 @@ test('application exec rejects stopped and foreign application targets', functio
     expect($this->runner->calls)->toBeEmpty();
 })->with(['stopped', 'foreign']);
 
+test('application exec rejects Swarm targets until a running task container can be resolved', function () {
+    $this->server->settings()->update(['is_swarm_manager' => true]);
+    Process::fake(['*' => Process::result(output: auditedApplicationContainer())]);
+
+    $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/applications/{$this->application->uuid}/exec", ['command' => 'whoami'])
+        ->assertUnprocessable()
+        ->assertJsonPath('message', 'Application exec on Swarm targets is not supported.');
+
+    expect($this->runner->calls)->toBeEmpty();
+    Process::assertNothingRan();
+});
+
 test('application exec treats pull request id zero as the base deployment', function () {
     Process::fake(['*' => Process::result(output: auditedApplicationContainer('base').auditedApplicationContainer('preview-12', pullRequestId: 12))]);
 
@@ -572,7 +630,7 @@ test('application exec treats pull request id zero as the base deployment', func
         ])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'base' sh -s");
+    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'base' timeout -k 1s 10s sh -s");
 });
 
 test('application exec selects only the requested pull request container', function () {
@@ -585,7 +643,20 @@ test('application exec selects only the requested pull request container', funct
         ])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'preview-12' sh -s");
+    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'preview-12' timeout -k 1s 10s sh -s");
+});
+
+test('application exec pull request selector never substring matches another PR label', function () {
+    Process::fake(['*' => Process::result(output: auditedApplicationContainer('preview-12', pullRequestId: 12))]);
+
+    $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/applications/{$this->application->uuid}/exec", [
+            'command' => 'whoami',
+            'pull_request_id' => 1,
+        ])
+        ->assertNotFound();
+
+    expect($this->runner->calls)->toBeEmpty();
 });
 
 test('application exec uses sudo only for docker on a non-root managed server', function () {
@@ -596,7 +667,7 @@ test('application exec uses sudo only for docker on a non-root managed server', 
         ->postJson("/api/v1/applications/{$this->application->uuid}/exec", ['command' => 'whoami'])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("sudo docker exec -i 'app-container' sh -s")
+    expect($this->runner->calls[0]['argv'])->toContain("sudo docker exec -i 'app-container' timeout -k 1s 10s sh -s")
         ->and($this->runner->calls[0]['argv'])->toContain('deploy@'.$this->server->ip);
 });
 

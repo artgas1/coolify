@@ -67,14 +67,31 @@ test('terminal process runner truncates multibyte output on a valid utf8 boundar
         ->and($result['stdout'])->toEndWith('[... Output truncated at 65536 bytes ...]');
 });
 
-test('terminal process runner converts timeouts to exit code 124', function () {
+test('terminal process runner gives the remote timeout a bounded cleanup grace before local termination', function () {
+    expect(TerminalCommandProcessRunner::localProcessTimeoutSeconds(1))->toBe(3)
+        ->and(TerminalCommandProcessRunner::maximumSupervisionSeconds(1))->toBe(4);
+
     $result = resolve(TerminalCommandProcessRunner::class)->run(
         ['sh', '-s'],
-        "sleep 2\n",
+        "sleep 5\n",
         1,
     );
 
     expect($result)
         ->exit_code->toBe(124)
-        ->stderr->toContain('timed out after 1 seconds');
+        ->stderr->toContain('timed out after 1 seconds')
+        ->duration_ms->toBeGreaterThanOrEqual(3_000)
+        ->duration_ms->toBeLessThan(5_000);
+});
+
+test('missing remote timeout fails before the stdin shell script starts', function () {
+    $result = resolve(TerminalCommandProcessRunner::class)->run(
+        ['/bin/sh', '-c', 'PATH=/definitely-missing timeout -k 1s 1s sh -s'],
+        "printf 'payload-must-not-run'\n",
+        1,
+    );
+
+    expect($result)
+        ->exit_code->toBe(127)
+        ->stdout->not->toContain('payload-must-not-run');
 });

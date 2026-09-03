@@ -11,7 +11,8 @@ use App\Models\PersonalAccessToken;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
-use Illuminate\Contracts\Cache\Lock;
+use Illuminate\Cache\Lock as CacheLock;
+use Illuminate\Contracts\Cache\Lock as LockContract;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -45,7 +46,7 @@ class TerminalCommandService
 
     private const SERVER_CONCURRENCY_LIMIT = 3;
 
-    private const LOCK_GRACE_SECONDS = 2;
+    private const LOCK_LEASE_BUFFER_SECONDS = 1;
 
     public function __construct(
         private readonly TerminalCommandProcessRunner $processRunner,
@@ -125,16 +126,18 @@ class TerminalCommandService
             );
 
             try {
-                $remoteCommand = is_null($container)
-                    ? 'sh -s'
-                    : ($server->isNonRoot() ? 'sudo ' : '').'docker exec -i '.escapeshellarg($container).' sh -s';
+                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout);
+                $remoteCommand = $this->remoteCommand($server, $container, $timeout);
                 $argv = SshMultiplexingHelper::generateSshStdinCommand($server, $remoteCommand);
+                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout);
                 $result = $this->processRunner->run($argv, $command."\n", $timeout);
                 $outcome = match (true) {
                     $result['exit_code'] === 124 => 'timed_out',
                     $result['exit_code'] === 0 => 'success',
                     default => 'failed',
                 };
+            } catch (TerminalCommandLimitException $exception) {
+                throw $exception;
             } catch (Throwable) {
                 $result = [
                     'exit_code' => 1,
@@ -175,7 +178,8 @@ class TerminalCommandService
     private function enforceRateLimits(int $teamId, Server $server, PersonalAccessToken $token): void
     {
         $tokenKey = "terminal-api-exec:token:{$teamId}:{$token->id}";
-        if (RateLimiter::tooManyAttempts($tokenKey, self::TOKEN_RATE_LIMIT_PER_MINUTE)) {
+        $tokenAttempts = RateLimiter::increment($tokenKey, 60);
+        if ($tokenAttempts > self::TOKEN_RATE_LIMIT_PER_MINUTE) {
             $retryAfter = max(1, RateLimiter::availableIn($tokenKey));
             throw new TerminalCommandLimitException(
                 "Too many terminal command requests. Please retry in {$retryAfter} seconds.",
@@ -184,24 +188,22 @@ class TerminalCommandService
         }
 
         $serverKey = "terminal-api-exec:server:{$teamId}:{$server->uuid}";
-        if (RateLimiter::tooManyAttempts($serverKey, self::SERVER_RATE_LIMIT_PER_MINUTE)) {
+        $serverAttempts = RateLimiter::increment($serverKey, 60);
+        if ($serverAttempts > self::SERVER_RATE_LIMIT_PER_MINUTE) {
             $retryAfter = max(1, RateLimiter::availableIn($serverKey));
             throw new TerminalCommandLimitException(
                 "Too many terminal commands for this server. Please retry in {$retryAfter} seconds.",
                 $retryAfter,
             );
         }
-
-        RateLimiter::hit($tokenKey, 60);
-        RateLimiter::hit($serverKey, 60);
     }
 
-    private function acquireConcurrencySlot(int $teamId, Server $server, int $timeout): Lock
+    private function acquireConcurrencySlot(int $teamId, Server $server, int $timeout): LockContract
     {
         foreach (range(1, self::SERVER_CONCURRENCY_LIMIT) as $slot) {
             $lock = Cache::lock(
                 "terminal-api-exec:concurrent:team:{$teamId}:server:{$server->uuid}:{$slot}",
-                $timeout + self::LOCK_GRACE_SECONDS,
+                $this->concurrencyLeaseSeconds($timeout),
             );
 
             if ($lock->get()) {
@@ -213,6 +215,58 @@ class TerminalCommandService
             'Too many terminal commands are already running on this server. Please retry shortly.',
             1,
         );
+    }
+
+    private function refreshConcurrencySlot(LockContract $lock, AuditEvent $auditEvent, int $timeout): void
+    {
+        try {
+            $isOwned = $lock instanceof CacheLock && $lock->isOwnedByCurrentProcess();
+            $refreshed = $isOwned && $lock->refresh($this->concurrencyLeaseSeconds($timeout));
+        } catch (Throwable $exception) {
+            $isOwned = false;
+            $refreshed = false;
+            Log::warning('Terminal command concurrency lock refresh failed', [
+                'audit_event_id' => $auditEvent->id,
+                'exception' => $exception::class,
+            ]);
+        }
+
+        if ($isOwned && $refreshed) {
+            return;
+        }
+
+        $this->finishAuditEvent($auditEvent, [
+            'exit_code' => null,
+            'duration_ms' => 0,
+            'stdout_bytes' => 0,
+            'stderr_bytes' => 0,
+            'stdout_truncated' => false,
+            'stderr_truncated' => false,
+        ], 'unknown', [
+            'remote_process_started' => false,
+            'not_started_reason' => 'concurrency_lock_lost',
+        ]);
+
+        throw new TerminalCommandLimitException(
+            'Terminal command concurrency slot was lost before execution. Please retry shortly.',
+            1,
+        );
+    }
+
+    private function concurrencyLeaseSeconds(int $timeout): int
+    {
+        return TerminalCommandProcessRunner::maximumSupervisionSeconds($timeout) + self::LOCK_LEASE_BUFFER_SECONDS;
+    }
+
+    private function remoteCommand(Server $server, ?string $container, int $timeout): string
+    {
+        $supervisedShell = "timeout -k 1s {$timeout}s sh -s";
+        if (is_null($container)) {
+            return $supervisedShell;
+        }
+
+        return ($server->isNonRoot() ? 'sudo ' : '')
+            .'docker exec -i '.escapeshellarg($container).' '.$supervisedShell;
     }
 
     private function beginAuditEvent(
@@ -276,9 +330,10 @@ class TerminalCommandService
     }
 
     /**
-     * @param  array{exit_code: int, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool}  $result
+     * @param  array{exit_code: int|null, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool}  $result
+     * @param  array<string, mixed>  $additionalMetadata
      */
-    private function finishAuditEvent(AuditEvent $auditEvent, array $result, string $outcome): void
+    private function finishAuditEvent(AuditEvent $auditEvent, array $result, string $outcome, array $additionalMetadata = []): void
     {
         $finalMetadata = array_merge($auditEvent->metadata ?? [], [
             'outcome' => $outcome,
@@ -289,7 +344,7 @@ class TerminalCommandService
             'stdout_truncated' => $result['stdout_truncated'],
             'stderr_truncated' => $result['stderr_truncated'],
             'finished_at' => now()->toIso8601String(),
-        ]);
+        ], $additionalMetadata);
 
         try {
             $auditEvent->metadata = $finalMetadata;

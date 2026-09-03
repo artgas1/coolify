@@ -19,7 +19,7 @@ class ApplicationExecController extends Controller
 {
     #[OA\Post(
         summary: 'Execute command',
-        description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.',
+        description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.',
         path: '/applications/{uuid}/exec',
         operationId: 'execute-command-in-application',
         security: [['bearerAuth' => []]],
@@ -49,7 +49,10 @@ class ApplicationExecController extends Controller
                 properties: [new OA\Property(property: 'message', type: 'string')],
             )),
             new OA\Response(response: 404, ref: '#/components/responses/404'),
-            new OA\Response(response: 422, ref: '#/components/responses/422'),
+            new OA\Response(response: 422, description: 'Validation or target ambiguity error. Swarm application targets are not supported.', content: new OA\JsonContent(
+                required: ['message'],
+                properties: [new OA\Property(property: 'message', type: 'string')],
+            )),
             new OA\Response(response: 429, description: 'Terminal command rate or concurrency limit exceeded.', content: new OA\JsonContent(
                 required: ['message', 'retry_after'],
                 properties: [
@@ -168,6 +171,12 @@ class ApplicationExecController extends Controller
             }
         }
 
+        if ($servers->contains(fn (Server $server): bool => $server->isSwarm())) {
+            return response()->json([
+                'message' => 'Application exec on Swarm targets is not supported.',
+            ], 422);
+        }
+
         $runningContainers = collect();
         $disabledServers = collect();
 
@@ -178,14 +187,12 @@ class ApplicationExecController extends Controller
                 continue;
             }
 
-            $containers = $server->isSwarm()
-                ? $this->swarmContainers($application)
-                : getCurrentApplicationContainerStatus(
-                    $server,
-                    $application->id,
-                    $pullRequestId,
-                    includePullrequests: is_null($pullRequestId),
-                );
+            $containers = getCurrentApplicationContainerStatus(
+                $server,
+                $application->id,
+                $pullRequestId,
+                includePullrequests: is_null($pullRequestId),
+            );
 
             $containers
                 ->filter(fn (mixed $container): bool => data_get($container, 'State') === 'running')
@@ -229,18 +236,6 @@ class ApplicationExecController extends Controller
         }
 
         return $runningContainers->first();
-    }
-
-    private function swarmContainers(Application $application): Collection
-    {
-        if (! str((string) $application->status)->startsWith('running')) {
-            return collect();
-        }
-
-        return collect([[
-            'Names' => $application->uuid.'_'.$application->uuid,
-            'State' => 'running',
-        ]]);
     }
 
     private function ambiguousTargetResponse(string $message, Collection $targets): JsonResponse

@@ -24,8 +24,15 @@ it('documents the bounded audited terminal exec contract for both targets', func
             ->and($limitResponse['required'])
             ->toBe(['message', 'retry_after'])
             ->and($limitResponse['properties']['retry_after']['minimum'])
-            ->toBe(1);
+            ->toBe(1)
+            ->and($operation['description'])
+            ->toContain('ordinary command tree', 'not a sandbox', 'deliberately detached processes', 'timeout executable');
     }
+
+    expect($openApi['paths']['/applications/{uuid}/exec']['post'])
+        ->description->toContain('Swarm application targets are not supported')
+        ->and($openApi['paths']['/applications/{uuid}/exec']['post']['responses']['422']['description'])
+        ->toContain('Swarm application targets are not supported');
 
     expect($openApi['components']['schemas']['TerminalCommandResult']['required'])
         ->toBe([

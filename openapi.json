@@ -17,7 +17,7 @@
                     "Applications"
                 ],
                 "summary": "Execute command",
-                "description": "Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.",
+                "description": "Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. Swarm application targets are not supported. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist in the target container; otherwise the shell script is not started.",
                 "operationId": "execute-command-in-application",
                 "parameters": [
                     {
@@ -106,7 +106,22 @@
                         "$ref": "#\/components\/responses\/404"
                     },
                     "422": {
-                        "$ref": "#\/components\/responses\/422"
+                        "description": "Validation or target ambiguity error. Swarm application targets are not supported.",
+                        "content": {
+                            "application\/json": {
+                                "schema": {
+                                    "required": [
+                                        "message"
+                                    ],
+                                    "properties": {
+                                        "message": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        }
                     },
                     "429": {
                         "description": "Terminal command rate or concurrency limit exceeded.",
@@ -15310,7 +15325,7 @@
                     "Servers"
                 ],
                 "summary": "Execute command",
-                "description": "Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.",
+                "description": "Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist on the target server; otherwise the shell script is not started.",
                 "operationId": "execute-command-on-server",
                 "parameters": [
                     {

@@ -16,7 +16,7 @@ class ServerExecController extends Controller
 {
     #[OA\Post(
         summary: 'Execute command',
-        description: 'Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.',
+        description: 'Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in. The timeout supervises the ordinary command tree but this arbitrary-code-execution API is not a sandbox and cannot universally stop deliberately detached processes. A compatible timeout executable must exist on the target server; otherwise the shell script is not started.',
         path: '/servers/{uuid}/exec',
         operationId: 'execute-command-on-server',
         security: [['bearerAuth' => []]],
