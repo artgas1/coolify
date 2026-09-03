@@ -16,6 +16,7 @@ class ApiAbility extends CheckForAnyAbility
         'write:sensitive',
         'deploy',
         'read:sensitive',
+        'terminal',
     ];
 
     public function handle($request, $next, ...$abilities)

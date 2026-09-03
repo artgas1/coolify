@@ -32,7 +32,8 @@ class EnsureTokenBelongsToCurrentTeamMember
             || $token->can('write')
             || $token->can('write:sensitive')
             || $token->can('deploy')
-            || $token->can('read:sensitive');
+            || $token->can('read:sensitive')
+            || $token->can('terminal');
 
         if ($elevated && ! in_array($role, ['admin', 'owner'], true)) {
             // MCP clients expect JSON-RPC envelopes (often only parsed on HTTP 200).

@@ -5,12 +5,16 @@ use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Once;
+use Livewire\Features\SupportLockedProperties\CannotUpdateLockedPropertyException;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0], ['is_api_enabled' => true]);
+    Once::flush();
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
+    $this->withoutVite();
 
     $this->team = Team::factory()->create();
 
@@ -74,17 +78,28 @@ describe('Livewire ApiTokens — member cannot create elevated tokens', function
         expect($this->member->tokens()->count())->toBe(0);
     });
 
+    test('member cannot create token with terminal permissions', function () {
+        $this->actingAs($this->member);
+        session(['currentTeam' => $this->team]);
+
+        Livewire::test(ApiTokens::class)
+            ->set('description', 'my-terminal-token')
+            ->set('expiresInDays', 30)
+            ->set('permissions', ['terminal'])
+            ->call('addNewToken')
+            ->assertDispatched('error');
+
+        expect($this->member->tokens()->count())->toBe(0);
+    });
+
     test('member cannot bypass by setting canUseRootPermissions property', function () {
         $this->actingAs($this->member);
         session(['currentTeam' => $this->team]);
 
-        // Simulate snapshot replay: force the boolean to true
-        Livewire::test(ApiTokens::class)
-            ->set('canUseRootPermissions', true)
-            ->set('description', 'sneaky-root-token')
-            ->set('permissions', ['root'])
-            ->call('addNewToken')
-            ->assertDispatched('error');
+        // Simulate snapshot replay: Livewire must reject the locked policy result.
+        expect(fn () => Livewire::test(ApiTokens::class)
+            ->set('canUseRootPermissions', true))
+            ->toThrow(CannotUpdateLockedPropertyException::class);
 
         expect($this->member->tokens()->count())->toBe(0);
     });
@@ -116,6 +131,43 @@ describe('Livewire ApiTokens — member cannot create elevated tokens', function
         expect($this->owner->tokens()->count())->toBe(1);
         expect($this->owner->tokens()->first()->abilities)->toBe(['root']);
     });
+
+    test('owner can create a terminal token expiring within 90 days', function () {
+        $this->actingAs($this->owner);
+        session(['currentTeam' => $this->team]);
+
+        Livewire::test(ApiTokens::class)
+            ->set('description', 'my-terminal-token')
+            ->set('expiresInDays', 90)
+            ->set('permissions', ['terminal'])
+            ->call('addNewToken')
+            ->assertNotDispatched('error');
+
+        $token = $this->owner->tokens()->first();
+        expect($token->abilities)->toBe(['terminal'])
+            ->and($token->expires_at)->not->toBeNull()
+            ->and($token->expires_at->lessThanOrEqualTo($token->created_at->addDays(90)))->toBeTrue();
+    });
+
+    test('tampered terminal token expiry over 90 days is rejected', function () {
+        $this->actingAs($this->owner);
+        session(['currentTeam' => $this->team]);
+
+        Livewire::test(ApiTokens::class)
+            ->set('description', 'long-terminal-token')
+            ->set('permissions', ['terminal'])
+            ->set('expiresInDays', 365)
+            ->call('addNewToken')
+            ->assertDispatched('error');
+
+        expect($this->owner->tokens()->count())->toBe(0);
+    });
+});
+
+test('terminal api team flag defaults off and remains null safe in the team form', function () {
+    $team = Team::factory()->create();
+
+    expect($team->is_terminal_api_enabled)->toBeFalse();
 });
 
 describe('ApiAbility middleware — member with elevated token blocked', function () {

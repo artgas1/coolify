@@ -16,6 +16,7 @@ beforeEach(function () {
         'id' => 0,
         'is_api_enabled' => true,
     ]));
+    $this->withoutVite();
 
     $this->team = Team::factory()->create();
 });
@@ -27,6 +28,7 @@ test('api token permission flags are locked', function (string $property) {
 })->with([
     'root permission flag' => 'canUseRootPermissions',
     'write permission flag' => 'canUseWritePermissions',
+    'terminal permission flag' => 'canUseTerminalPermissions',
 ]);
 
 test('member cannot tamper with root permission flag', function () {

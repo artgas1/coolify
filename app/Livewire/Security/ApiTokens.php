@@ -42,6 +42,9 @@ class ApiTokens extends Component
     #[Locked]
     public bool $canUseSensitivePermissions = false;
 
+    #[Locked]
+    public bool $canUseTerminalPermissions = false;
+
     public function render()
     {
         return view('livewire.security.api-tokens');
@@ -54,6 +57,7 @@ class ApiTokens extends Component
         $this->canUseWritePermissions = auth()->user()->can('useWritePermissions', PersonalAccessToken::class);
         $this->canUseDeployPermissions = auth()->user()->can('useDeployPermissions', PersonalAccessToken::class);
         $this->canUseSensitivePermissions = auth()->user()->can('useSensitivePermissions', PersonalAccessToken::class);
+        $this->canUseTerminalPermissions = auth()->user()->can('useTerminalPermissions', PersonalAccessToken::class);
         $this->getTokens();
     }
 
@@ -96,6 +100,19 @@ class ApiTokens extends Component
             return;
         }
 
+        if ($permissionToUpdate == 'terminal' && ! auth()->user()->can('useTerminalPermissions', PersonalAccessToken::class)) {
+            $this->dispatch('error', 'You do not have permission to use terminal permissions.');
+            $this->permissions = array_diff($this->permissions, ['terminal']);
+
+            return;
+        }
+
+        if ($permissionToUpdate == 'terminal' && in_array('terminal', $this->permissions, true)) {
+            if (is_null($this->expiresInDays) || $this->expiresInDays > 90) {
+                $this->expiresInDays = 90;
+            }
+        }
+
         if ($permissionToUpdate == 'root' && in_array('root', $this->permissions, true)) {
             $this->permissions = ['root'];
         } elseif ($permissionToUpdate == 'read:sensitive' && ! in_array('read', $this->permissions, true)) {
@@ -134,9 +151,15 @@ class ApiTokens extends Component
                 throw new \Exception('You do not have permission to create tokens with read:sensitive permissions.');
             }
 
+            if (in_array('terminal', $this->permissions, true) && ! auth()->user()->can('useTerminalPermissions', PersonalAccessToken::class)) {
+                throw new \Exception('You do not have permission to create tokens with terminal permissions.');
+            }
+
             $this->validate([
                 'description' => 'required|min:3|max:255',
-                'expiresInDays' => 'nullable|integer|in:7,30,60,90,365',
+                'expiresInDays' => in_array('terminal', $this->permissions, true)
+                    ? 'required|integer|in:7,30,60,90'
+                    : 'nullable|integer|in:7,30,60,90,365',
             ]);
             $expiresAt = $this->expiresInDays ? now()->addDays($this->expiresInDays) : null;
             $token = auth()->user()->createToken($this->description, array_values($this->permissions), $expiresAt);

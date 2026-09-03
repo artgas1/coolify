@@ -8,6 +8,7 @@ use App\Notifications\Channels\SendsEmail;
 use App\Notifications\TransactionalEmails\EmailChangeVerification;
 use App\Notifications\TransactionalEmails\ResetPassword as TransactionalEmailsResetPassword;
 use App\Services\ChangelogService;
+use App\Services\Terminal\TerminalTokenGuard;
 use App\Traits\DeletesUserSessions;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -235,6 +236,9 @@ class User extends Authenticatable implements SendsEmail
 
     public function createToken(string $name, array $abilities = ['*'], ?DateTimeInterface $expiresAt = null)
     {
+        $teamId = (int) session('currentTeam')->id;
+        resolve(TerminalTokenGuard::class)->validateIssuance($this, $teamId, $abilities, $expiresAt);
+
         $plainTextToken = sprintf(
             '%s%s%s',
             config('sanctum.token_prefix', ''),
@@ -247,7 +251,7 @@ class User extends Authenticatable implements SendsEmail
             'token' => hash('sha256', $plainTextToken),
             'abilities' => $abilities,
             'expires_at' => $expiresAt,
-            'team_id' => session('currentTeam')->id,
+            'team_id' => $teamId,
         ]);
 
         return new NewAccessToken($token, $token->getKey().'|'.$plainTextToken);

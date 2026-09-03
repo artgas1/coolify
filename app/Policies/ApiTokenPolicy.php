@@ -87,6 +87,14 @@ class ApiTokenPolicy
         return $user->isAdmin() || $user->isOwner();
     }
 
+    /**
+     * Determine whether the user can issue terminal API tokens.
+     */
+    public function useTerminalPermissions(User $user): bool
+    {
+        return $user->isAdmin() || $user->isOwner();
+    }
+
     private function belongsToUserAndCurrentTeam(User $user, PersonalAccessToken $token): bool
     {
         if ($user->id !== $token->tokenable_id || $token->tokenable_type !== User::class) {
