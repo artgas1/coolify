@@ -250,6 +250,55 @@ class SshMultiplexingHelper
             .$delimiter;
     }
 
+    /**
+     * Build a non-interactive SSH argv whose remote script is supplied separately on stdin.
+     *
+     * @return array<int, string>
+     */
+    public static function generateSshStdinCommand(Server $server, string $remoteCommand): array
+    {
+        if ($server->settings->force_disabled) {
+            throw new \RuntimeException('Server is disabled.');
+        }
+
+        $sshConfig = self::serverSshConfiguration($server);
+        $sshKeyLocation = $sshConfig['sshKeyLocation'];
+        self::validateSshKey($server->privateKey);
+
+        $sshCommand = [
+            'ssh',
+            ...($server->isIpv6() ? ['-6'] : []),
+            '-i',
+            $sshKeyLocation,
+            '-o',
+            'StrictHostKeyChecking=no',
+            '-o',
+            'UserKnownHostsFile=/dev/null',
+            '-o',
+            'PasswordAuthentication=no',
+            '-o',
+            'ConnectTimeout='.self::getConnectionTimeout($server),
+            '-o',
+            'ServerAliveInterval='.config('constants.ssh.server_interval'),
+            '-o',
+            'RequestTTY=no',
+            '-o',
+            'LogLevel=ERROR',
+            '-p',
+            (string) $server->port,
+        ];
+
+        if (data_get($server, 'settings.is_cloudflare_tunnel')) {
+            $sshCommand[] = '-o';
+            $sshCommand[] = 'ProxyCommand=cloudflared access ssh --hostname %h';
+        }
+
+        $sshCommand[] = $server->user.'@'.$server->ip;
+        $sshCommand[] = $remoteCommand;
+
+        return $sshCommand;
+    }
+
     private static function remoteShellCommand(): string
     {
         return 'if command -v bash >/dev/null 2>&1; then exec bash -se; else exec sh -se; fi';

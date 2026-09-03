@@ -25,6 +25,14 @@
                                 ['value' => true, 'label' => 'Enabled for this team'],
                             ]" />
                     </div>
+                    <div class="lg:col-span-2">
+                        <x-forms.listbox canGate="update" :canResource="$team" id="is_terminal_api_enabled" label="Terminal API"
+                            helper="Allows short-lived terminal-scoped API tokens to run audited commands on this team's servers and applications."
+                            :disabled="! auth()->user()->can('update', $team)" :options="[
+                                ['value' => false, 'label' => 'Disabled for this team'],
+                                ['value' => true, 'label' => 'Enabled for this team'],
+                            ]" />
+                    </div>
                 </div>
             </x-application.settings-section>
         </form>

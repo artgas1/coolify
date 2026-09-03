@@ -23,10 +23,13 @@
     @else
         @php
             $expirationList = collect($expirationOptions)
+                ->when(in_array('terminal', $permissions, true), fn ($options) => $options->filter(fn ($label, $days) => $days <= 90))
                 ->map(fn ($label, $days) => ['value' => (string) $days, 'label' => $label])
-                ->values()
-                ->push(['value' => '', 'label' => 'Never'])
-                ->all();
+                ->values();
+            if (!in_array('terminal', $permissions, true)) {
+                $expirationList->push(['value' => '', 'label' => 'Never']);
+            }
+            $expirationList = $expirationList->all();
         @endphp
 
         <div class="application-settings-form flex flex-col gap-6">
@@ -98,6 +101,13 @@
                                             helper="Include secrets, logs, passwords, and Compose content."
                                             :checked="in_array('read:sensitive', $permissions)"
                                             :disabled="in_array('root', $permissions) || !$canUseSensitivePermissions" />
+                                    </div>
+                                    <div class="listbox-option p-0!">
+                                        <x-forms.checkbox id="permission-terminal" label="Terminal" fullWidth
+                                            wire:model.live="permissions" domValue="terminal"
+                                            helper="Run short-lived, audited commands on opted-in team servers and applications."
+                                            :checked="in_array('terminal', $permissions)"
+                                            :disabled="in_array('root', $permissions) || !$canUseTerminalPermissions" />
                                     </div>
                                 </div>
                             </div>

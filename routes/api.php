@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\ApplicationExecController;
 use App\Http\Controllers\Api\ApplicationsController;
 use App\Http\Controllers\Api\ApplicationSecretManagerController;
 use App\Http\Controllers\Api\AuditEventsController;
@@ -24,6 +25,7 @@ use App\Http\Controllers\Api\SecurityController;
 use App\Http\Controllers\Api\SentinelController;
 use App\Http\Controllers\Api\ServerCloudflareTunnelController;
 use App\Http\Controllers\Api\ServerDockerCleanupController;
+use App\Http\Controllers\Api\ServerExecController;
 use App\Http\Controllers\Api\ServerLogDrainsController;
 use App\Http\Controllers\Api\ServerProxyController;
 use App\Http\Controllers\Api\ServersController;
@@ -155,6 +157,7 @@ Route::group([
 
     Route::get('/servers', [ServersController::class, 'servers'])->middleware(['api.ability:read']);
     Route::get('/servers/{uuid}', [ServersController::class, 'server_by_uuid'])->middleware(['api.ability:read']);
+    Route::post('/servers/{uuid}/exec', ServerExecController::class)->middleware(['terminal.api']);
     Route::get('/servers/{uuid}/domains', [ServersController::class, 'domains_by_server'])->middleware(['api.ability:read']);
     Route::get('/servers/{uuid}/resources', [ServersController::class, 'resources_by_server'])->middleware(['api.ability:read']);
     Route::get('/servers/{uuid}/envs', [SharedEnvironmentVariablesController::class, 'server_envs'])->middleware(['api.ability:read']);
@@ -240,6 +243,7 @@ Route::group([
     Route::post('/applications/dockerimage', [ApplicationsController::class, 'create_dockerimage_application'])->middleware(['api.ability:write']);
 
     Route::get('/applications/{uuid}', [ApplicationsController::class, 'application_by_uuid'])->middleware(['api.ability:read']);
+    Route::post('/applications/{uuid}/exec', ApplicationExecController::class)->middleware(['terminal.api']);
     Route::patch('/applications/{uuid}', [ApplicationsController::class, 'update_by_uuid'])->middleware(['api.ability:write']);
     Route::delete('/applications/{uuid}', [ApplicationsController::class, 'delete_by_uuid'])->middleware(['api.ability:write']);
     Route::patch('/applications/{uuid}/secret-manager', [ApplicationSecretManagerController::class, 'update'])->middleware(['api.ability:write']);

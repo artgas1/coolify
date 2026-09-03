@@ -23,12 +23,15 @@ class Index extends Component
 
     public bool $is_mcp_server_enabled = true;
 
+    public bool $is_terminal_api_enabled = false;
+
     protected function rules(): array
     {
         return [
             'name' => ValidationPatterns::nameRules(),
             'description' => ValidationPatterns::descriptionRules(),
             'is_mcp_server_enabled' => 'boolean',
+            'is_terminal_api_enabled' => 'boolean',
         ];
     }
 
@@ -59,6 +62,7 @@ class Index extends Component
             $this->team->name = $this->name;
             $this->team->description = $this->description;
             $this->team->is_mcp_server_enabled = $this->is_mcp_server_enabled;
+            $this->team->is_terminal_api_enabled = $this->is_terminal_api_enabled;
         } else {
             // Sync FROM model (on load/refresh)
             $this->name = $this->team->name;
@@ -66,6 +70,7 @@ class Index extends Component
             // Null can appear after Team::create() when the DB default is not
             // hydrated onto the in-memory model stored in session.
             $this->is_mcp_server_enabled = (bool) ($this->team->is_mcp_server_enabled ?? true);
+            $this->is_terminal_api_enabled = (bool) ($this->team->is_terminal_api_enabled ?? false);
         }
     }
 

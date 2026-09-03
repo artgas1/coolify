@@ -7,6 +7,137 @@ servers:
     url: 'https://app.coolify.io/api/v1'
     description: 'Coolify Cloud API. Change the host to your own instance if you are self-hosting.'
 paths:
+  '/applications/{uuid}/exec':
+    post:
+      tags:
+        - Applications
+      summary: 'Execute command'
+      description: 'Execute a bounded non-interactive shell command in a running application container. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.'
+      operationId: execute-command-in-application
+      parameters:
+        -
+          name: uuid
+          in: path
+          description: 'Application UUID'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              required:
+                - command
+              properties:
+                command:
+                  description: 'Shell script. Prefer reading secrets from the target environment instead of passing literal secret values.'
+                  type: string
+                  maxLength: 20000
+                  minLength: 1
+                timeout:
+                  type: integer
+                  default: 10
+                  maximum: 10
+                  minimum: 1
+                container:
+                  type: string
+                  maxLength: 255
+                server_uuid:
+                  type: string
+                  maxLength: 255
+                pull_request_id:
+                  type: integer
+                  minimum: 0
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: 'Command finished, including non-zero exits and timeouts.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalCommandResult'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          description: 'Terminal access denied.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          description: 'Terminal command rate or concurrency limit exceeded.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                  - retry_after
+                properties:
+                  message: { type: string }
+                  retry_after: { type: integer, minimum: 1 }
+                type: object
+        '503':
+          description: 'The initial audit record could not be persisted; no command was started.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
+      security:
+        -
+          bearerAuth: []
+  '/applications/{uuid}/secret-manager':
+    patch:
+      tags:
+        - 'Secret Managers'
+      summary: 'Configure Application Secret Manager'
+      description: 'Configure the secret manager source used by an application.'
+      operationId: configure-application-secret-manager
+      parameters:
+        -
+          name: uuid
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              required:
+                - integration_token_uuid
+              properties:
+                integration_token_uuid:
+                  type: string
+                settings:
+                  type: object
+              type: object
+      responses:
+        '200':
+          description: 'Secret manager configured.'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+      security:
+        -
+          bearerAuth: []
   /applications:
     get:
       tags:
@@ -7490,12 +7621,86 @@ paths:
       security:
         -
           bearerAuth: []
+  /settings/email:
+    get:
+      tags:
+        - Settings
+      summary: 'Get instance email settings'
+      description: 'Get instance-wide SMTP and Resend settings. Requires a root-team token belonging to a root-team admin or owner. Sensitive fields require the `read:sensitive` or `root` token ability.'
+      operationId: get-instance-email-settings
+      responses:
+        '200':
+          description: 'Instance email settings.'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          description: Forbidden.
+      security:
+        -
+          bearerAuth: []
+    patch:
+      tags:
+        - Settings
+      summary: 'Update instance email settings'
+      description: 'Update instance-wide SMTP and Resend settings. Requires `write:sensitive` and a root-team token belonging to a root-team admin or owner.'
+      operationId: update-instance-email-settings
+      responses:
+        '200':
+          description: 'Updated instance email settings.'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          description: Forbidden.
+        '422':
+          $ref: '#/components/responses/422'
+      security:
+        -
+          bearerAuth: []
+  /security/integration-tokens:
+    post:
+      tags:
+        - 'Secret Managers'
+      summary: 'Create Secret Manager Token'
+      description: 'Create and validate a Doppler, Infisical, or Vault integration token.'
+      operationId: create-secret-manager-integration-token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              required:
+                - provider
+                - name
+                - token
+              properties:
+                provider:
+                  type: string
+                  enum: [doppler, infisical, vault]
+                name:
+                  type: string
+                token:
+                  type: string
+                metadata:
+                  type: object
+              type: object
+      responses:
+        '201':
+          description: 'Integration token created.'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '422':
+          $ref: '#/components/responses/422'
+      security:
+        -
+          bearerAuth: []
   /notifications/email:
     get:
       tags:
         - Notifications
       summary: 'Get email notification settings'
-      description: 'Get the current team email notification settings. Encrypted secrets are only returned when the token has `read:sensitive` (or `root`) and the user is a team admin/owner.'
+      description: 'Get the current team email notification settings, including `smtp_ehlo_domain`, the hostname sent with SMTP EHLO. Encrypted secrets are only returned when the token has `read:sensitive` (or `root`) and the user is a team admin/owner.'
       operationId: get-current-team-email-notifications
       responses:
         '200':
@@ -7511,7 +7716,7 @@ paths:
       tags:
         - Notifications
       summary: 'Update email notification settings'
-      description: 'Update the current team email notification settings.'
+      description: 'Update the current team email notification settings. Set `smtp_ehlo_domain` to a valid hostname to control the SMTP EHLO domain, or `null` to use the system default.'
       operationId: update-current-team-email-notifications
       responses:
         '200':
@@ -9566,6 +9771,89 @@ paths:
       security:
         -
           bearerAuth: []
+  '/servers/{uuid}/exec':
+    post:
+      tags:
+        - Servers
+      summary: 'Execute command'
+      description: 'Execute a bounded non-interactive shell command on a managed server. Requires a literal terminal token ability with a lifetime of at most 90 days and team opt-in.'
+      operationId: execute-command-on-server
+      parameters:
+        -
+          name: uuid
+          in: path
+          description: 'Server UUID'
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              required:
+                - command
+              properties:
+                command:
+                  description: 'Shell script. Prefer reading secrets from the target environment instead of passing literal secret values.'
+                  type: string
+                  maxLength: 20000
+                  minLength: 1
+                timeout:
+                  type: integer
+                  default: 10
+                  maximum: 10
+                  minimum: 1
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: 'Command finished, including non-zero exits and timeouts.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TerminalCommandResult'
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          description: 'Terminal access denied.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
+        '404':
+          $ref: '#/components/responses/404'
+        '422':
+          $ref: '#/components/responses/422'
+        '429':
+          description: 'Terminal command rate or concurrency limit exceeded.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                  - retry_after
+                properties:
+                  message: { type: string }
+                  retry_after: { type: integer, minimum: 1 }
+                type: object
+        '503':
+          description: 'The initial audit record could not be persisted; no command was started.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
+      security:
+        -
+          bearerAuth: []
   '/servers/{uuid}/log-drains':
     get:
       tags:
@@ -10657,6 +10945,8 @@ paths:
                 is_gzip_enabled:
                   type: [boolean, 'null']
                 is_stripprefix_enabled:
+                  type: [boolean, 'null']
+                is_force_https_enabled:
                   type: [boolean, 'null']
               type: object
       responses:
@@ -13659,7 +13949,7 @@ components:
           minimum: 0
         timeout:
           type: integer
-          default: 3600
+          default: 36000
           maximum: 36000
           minimum: 60
       type: object
@@ -14429,6 +14719,8 @@ components:
           type: integer
         deployment_queue_limit:
           type: integer
+        backup_compression_cpu_percentage:
+          type: integer
         dynamic_timeout:
           type: integer
         force_disabled:
@@ -14504,6 +14796,22 @@ components:
         connection_timeout:
           type: integer
           description: 'SSH connection timeout in seconds.'
+        docker_version:
+          type: string
+          nullable: true
+          description: 'Detected Docker Engine version on the server.'
+        docker_version_checked_at:
+          type: string
+          nullable: true
+          description: 'When Docker Engine version was last detected.'
+        compose_version:
+          type: string
+          nullable: true
+          description: 'Detected Docker Compose plugin version on the server.'
+        compose_version_checked_at:
+          type: string
+          nullable: true
+          description: 'When Docker Compose version was last detected.'
       type: object
     Service:
       description: 'Service model'
@@ -14662,6 +14970,32 @@ components:
           type: boolean
           description: 'The flag to receive marketing emails.'
       type: object
+    TerminalCommandResult:
+      required:
+        - exit_code
+        - stdout
+        - stderr
+        - duration_ms
+        - audit_event_id
+        - stdout_truncated
+        - stderr_truncated
+      properties:
+        exit_code:
+          type: integer
+        stdout:
+          type: string
+        stderr:
+          type: string
+        duration_ms:
+          type: integer
+          minimum: 0
+        audit_event_id:
+          type: integer
+        stdout_truncated:
+          type: boolean
+        stderr_truncated:
+          type: boolean
+      type: object
   responses:
     '400':
       description: 'Invalid token.'
@@ -14737,6 +15071,9 @@ tags:
     name: Applications
     description: Applications
   -
+    name: 'Secret Managers'
+    description: 'Secret Managers'
+  -
     name: 'Cloud-init Scripts'
     description: 'Cloud-init Scripts'
   -
@@ -14763,6 +15100,9 @@ tags:
   -
     name: Hetzner
     description: Hetzner
+  -
+    name: Settings
+    description: Settings
   -
     name: Notifications
     description: Notifications
