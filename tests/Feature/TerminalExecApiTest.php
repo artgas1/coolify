@@ -11,6 +11,7 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use App\Services\Terminal\TerminalCommandProcessRunner;
+use App\Services\Terminal\TerminalCommandService;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -27,10 +28,10 @@ uses(RefreshDatabase::class);
 
 class CapturingTerminalCommandProcessRunner extends TerminalCommandProcessRunner
 {
-    /** @var array<int, array{argv: array<int, string>, stdin: string, timeout: int}> */
+    /** @var array<int, array{argv: array<int, string>, stdin: string, timeout: int, connectionTimeout: int, timeoutMarker: string, completionMarker: string}> */
     public array $calls = [];
 
-    /** @var array{exit_code: int, stdout: string, stderr: string, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool} */
+    /** @var array{exit_code: int, stdout: string, stderr: string, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool} */
     public array $result = [
         'exit_code' => 0,
         'stdout' => "ok\n",
@@ -40,13 +41,20 @@ class CapturingTerminalCommandProcessRunner extends TerminalCommandProcessRunner
         'stderr_bytes' => 0,
         'stdout_truncated' => false,
         'stderr_truncated' => false,
+        'timed_out' => false,
     ];
 
     public ?string $exceptionMessage = null;
 
-    public function run(array $argv, string $stdin, int $timeout): array
-    {
-        $this->calls[] = compact('argv', 'stdin', 'timeout');
+    public function run(
+        array $argv,
+        string $stdin,
+        int $timeout,
+        int $connectionTimeout = 0,
+        string $timeoutMarker = '',
+        string $completionMarker = '',
+    ): array {
+        $this->calls[] = compact('argv', 'stdin', 'timeout', 'connectionTimeout', 'timeoutMarker', 'completionMarker');
         if (! is_null($this->exceptionMessage)) {
             throw new RuntimeException($this->exceptionMessage);
         }
@@ -172,6 +180,7 @@ function auditedApplicationContainer(string $name = 'app-container', string $sta
 
 test('server exec uses static ssh argv stdin and persists a redacted correlated audit event', function () {
     $command = 'TOKEN=super-secret printf done';
+    $this->server->settings()->update(['connection_timeout' => 45]);
     $this->runner->result['stdout'] = "super-secret output\n";
     $this->runner->result['stdout_bytes'] = 20;
 
@@ -188,14 +197,27 @@ test('server exec uses static ssh argv stdin and persists a redacted correlated 
         'duration_ms' => 12,
         'stdout_truncated' => false,
         'stderr_truncated' => false,
+        'timed_out' => false,
     ])->assertJsonStructure(['audit_event_id']);
 
     expect($this->runner->calls)->toHaveCount(1);
     $call = $this->runner->calls[0];
-    expect($call['argv'])->toContain('timeout -k 1s 4s sh -s')
+    expect($call['argv'])->toContain('ConnectTimeout=10')
+        ->and($call['argv'][array_key_last($call['argv'])])->toContain('timeout --preserve-status -k 1s 4s sh -c')
+        ->and($call['argv'][array_key_last($call['argv'])])->toContain('sh -s; status=$?; printf', 'case "$status" in 137|143)')
         ->and(implode(' ', $call['argv']))->not->toContain($command)
         ->and($call['stdin'])->toBe($command."\n")
-        ->and($call['timeout'])->toBe(4);
+        ->and($call['timeout'])->toBe(4)
+        ->and($call['connectionTimeout'])->toBe(10)
+        ->and($call['timeoutMarker'])->toMatch('/^__COOLIFY_TERMINAL_TIMEOUT_[0-9a-f]{64}__$/')
+        ->and($call['completionMarker'])->toMatch('/^__COOLIFY_TERMINAL_COMPLETE_[0-9a-f]{64}__$/')
+        ->and($call['argv'][array_key_last($call['argv'])])->toContain($call['timeoutMarker'])
+        ->and($call['argv'][array_key_last($call['argv'])])->toContain($call['completionMarker'])
+        ->and(TerminalCommandProcessRunner::localProcessTimeoutSeconds(4, 10))->toBe(17);
+
+    $leaseMethod = new ReflectionMethod(TerminalCommandService::class, 'concurrencyLeaseSeconds');
+    $leaseMethod->setAccessible(true);
+    expect($leaseMethod->invoke(resolve(TerminalCommandService::class), 4, 10))->toBe(18);
 
     $audit = AuditEvent::query()->findOrFail($response->json('audit_event_id'));
     $metadata = $audit->metadata;
@@ -212,6 +234,7 @@ test('server exec uses static ssh argv stdin and persists a redacted correlated 
         ->and($metadata['command_redacted'])->toBe('TOKEN=[REDACTED] printf done')
         ->and($metadata['command_hmac_sha256'])->toBe(hash_hmac('sha256', $command, config('app.key')))
         ->and($metadata['server_uuid'])->toBe($this->server->uuid)
+        ->and($metadata['timed_out'])->toBeFalse()
         ->and(array_key_exists('stdout', $metadata))->toBeFalse()
         ->and(array_key_exists('stderr', $metadata))->toBeFalse()
         ->and(json_encode($audit->toArray(), JSON_THROW_ON_ERROR))->not->toContain('super-secret output')
@@ -507,7 +530,8 @@ test('application exec resolves a running container and shares the stdin executi
         ->assertOk();
 
     $call = $this->runner->calls[0];
-    expect($call['argv'])->toContain("docker exec -i 'app-container' timeout -k 1s 10s sh -s")
+    expect($call['argv'][array_key_last($call['argv'])])
+        ->toContain("docker exec -i 'app-container' sh -c", 'timeout --preserve-status -k 1s 10s sh -c')
         ->and(implode(' ', $call['argv']))->not->toContain($command)
         ->and($call['stdin'])->toBe($command."\n");
 
@@ -630,7 +654,8 @@ test('application exec treats pull request id zero as the base deployment', func
         ])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'base' timeout -k 1s 10s sh -s");
+    expect($this->runner->calls[0]['argv'][array_key_last($this->runner->calls[0]['argv'])])
+        ->toContain("docker exec -i 'base' sh -c", 'timeout --preserve-status -k 1s 10s sh -c');
 });
 
 test('application exec selects only the requested pull request container', function () {
@@ -643,7 +668,8 @@ test('application exec selects only the requested pull request container', funct
         ])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("docker exec -i 'preview-12' timeout -k 1s 10s sh -s");
+    expect($this->runner->calls[0]['argv'][array_key_last($this->runner->calls[0]['argv'])])
+        ->toContain("docker exec -i 'preview-12' sh -c", 'timeout --preserve-status -k 1s 10s sh -c');
 });
 
 test('application exec pull request selector never substring matches another PR label', function () {
@@ -667,7 +693,8 @@ test('application exec uses sudo only for docker on a non-root managed server', 
         ->postJson("/api/v1/applications/{$this->application->uuid}/exec", ['command' => 'whoami'])
         ->assertOk();
 
-    expect($this->runner->calls[0]['argv'])->toContain("sudo docker exec -i 'app-container' timeout -k 1s 10s sh -s")
+    expect($this->runner->calls[0]['argv'][array_key_last($this->runner->calls[0]['argv'])])
+        ->toContain("sudo docker exec -i 'app-container' sh -c", 'timeout --preserve-status -k 1s 10s sh -c')
         ->and($this->runner->calls[0]['argv'])->toContain('deploy@'.$this->server->ip);
 });
 
@@ -681,6 +708,7 @@ test('timeout result is returned normally and audited as timed out', function ()
         'stderr_bytes' => 35,
         'stdout_truncated' => false,
         'stderr_truncated' => false,
+        'timed_out' => true,
     ];
 
     $response = $this->withHeaders(auditedExecHeaders($this->bearerToken))
@@ -689,7 +717,25 @@ test('timeout result is returned normally and audited as timed out', function ()
             'timeout' => 2,
         ])
         ->assertOk()
-        ->assertJsonPath('exit_code', 124);
+        ->assertJsonPath('exit_code', 124)
+        ->assertJsonPath('timed_out', true);
 
-    expect(AuditEvent::query()->findOrFail($response->json('audit_event_id'))->metadata['outcome'])->toBe('timed_out');
+    $metadata = AuditEvent::query()->findOrFail($response->json('audit_event_id'))->metadata;
+    expect($metadata['outcome'])->toBe('timed_out')
+        ->and($metadata['timed_out'])->toBeTrue();
 });
+
+test('ordinary terminal exit status is not misclassified as a timeout', function (int $status) {
+    $this->runner->result['exit_code'] = $status;
+    $this->runner->result['timed_out'] = false;
+
+    $response = $this->withHeaders(auditedExecHeaders($this->bearerToken))
+        ->postJson("/api/v1/servers/{$this->server->uuid}/exec", ['command' => "exit {$status}"])
+        ->assertOk()
+        ->assertJsonPath('exit_code', $status)
+        ->assertJsonPath('timed_out', false);
+
+    $metadata = AuditEvent::query()->findOrFail($response->json('audit_event_id'))->metadata;
+    expect($metadata['outcome'])->toBe('failed')
+        ->and($metadata['timed_out'])->toBeFalse();
+})->with([124, 137, 143]);

@@ -23,7 +23,7 @@ use Throwable;
 #[OA\Schema(
     schema: 'TerminalCommandResult',
     type: 'object',
-    required: ['exit_code', 'stdout', 'stderr', 'duration_ms', 'audit_event_id', 'stdout_truncated', 'stderr_truncated'],
+    required: ['exit_code', 'stdout', 'stderr', 'duration_ms', 'audit_event_id', 'stdout_truncated', 'stderr_truncated', 'timed_out'],
     properties: [
         new OA\Property(property: 'exit_code', type: 'integer'),
         new OA\Property(property: 'stdout', type: 'string'),
@@ -32,6 +32,7 @@ use Throwable;
         new OA\Property(property: 'audit_event_id', type: 'integer'),
         new OA\Property(property: 'stdout_truncated', type: 'boolean'),
         new OA\Property(property: 'stderr_truncated', type: 'boolean'),
+        new OA\Property(property: 'timed_out', description: 'True only when a remote timeout supervisor marker was observed without controlled-shell completion, or the bounded local SSH watchdog expired.', type: 'boolean'),
     ],
 )]
 class TerminalCommandService
@@ -39,6 +40,8 @@ class TerminalCommandService
     public const DEFAULT_TIMEOUT_SECONDS = 10;
 
     public const MAX_TIMEOUT_SECONDS = 10;
+
+    public const MAX_CONNECTION_TIMEOUT_SECONDS = 10;
 
     private const TOKEN_RATE_LIMIT_PER_MINUTE = 30;
 
@@ -54,7 +57,7 @@ class TerminalCommandService
     ) {}
 
     /**
-     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool}
+     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool}
      */
     public function executeOnServer(
         Server $server,
@@ -75,7 +78,7 @@ class TerminalCommandService
     }
 
     /**
-     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool}
+     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool}
      */
     public function executeInApplication(
         Application $application,
@@ -98,7 +101,7 @@ class TerminalCommandService
     }
 
     /**
-     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool}
+     * @return array{exit_code: int, stdout: string, stderr: string, duration_ms: int, audit_event_id: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool}
      */
     private function execute(
         Server $server,
@@ -110,8 +113,9 @@ class TerminalCommandService
         ?string $container,
     ): array {
         $teamId = (int) $server->team_id;
+        $connectionTimeout = $this->connectionTimeoutSeconds($server);
         $this->enforceRateLimits($teamId, $server, $token);
-        $lock = $this->acquireConcurrencySlot($teamId, $server, $timeout);
+        $lock = $this->acquireConcurrencySlot($teamId, $server, $timeout, $connectionTimeout);
 
         try {
             $auditEvent = $this->beginAuditEvent(
@@ -126,13 +130,27 @@ class TerminalCommandService
             );
 
             try {
-                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout);
-                $remoteCommand = $this->remoteCommand($server, $container, $timeout);
-                $argv = SshMultiplexingHelper::generateSshStdinCommand($server, $remoteCommand);
-                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout);
-                $result = $this->processRunner->run($argv, $command."\n", $timeout);
+                [$timeoutMarker, $completionMarker] = $this->timeoutMarkers();
+                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout, $connectionTimeout);
+                $remoteCommand = $this->remoteCommand(
+                    server: $server,
+                    container: $container,
+                    timeout: $timeout,
+                    timeoutMarker: $timeoutMarker,
+                    completionMarker: $completionMarker,
+                );
+                $argv = SshMultiplexingHelper::generateSshStdinCommand($server, $remoteCommand, $connectionTimeout);
+                $this->refreshConcurrencySlot($lock, $auditEvent, $timeout, $connectionTimeout);
+                $result = $this->processRunner->run(
+                    argv: $argv,
+                    stdin: $command."\n",
+                    timeout: $timeout,
+                    connectionTimeout: $connectionTimeout,
+                    timeoutMarker: $timeoutMarker,
+                    completionMarker: $completionMarker,
+                );
                 $outcome = match (true) {
-                    $result['exit_code'] === 124 => 'timed_out',
+                    $result['timed_out'] => 'timed_out',
                     $result['exit_code'] === 0 => 'success',
                     default => 'failed',
                 };
@@ -148,6 +166,7 @@ class TerminalCommandService
                     'stderr_bytes' => strlen("Command execution failed.\n"),
                     'stdout_truncated' => false,
                     'stderr_truncated' => false,
+                    'timed_out' => false,
                 ];
                 $outcome = 'unknown';
             }
@@ -162,6 +181,7 @@ class TerminalCommandService
                 'audit_event_id' => $auditEvent->id,
                 'stdout_truncated' => $result['stdout_truncated'],
                 'stderr_truncated' => $result['stderr_truncated'],
+                'timed_out' => $result['timed_out'],
             ];
         } finally {
             try {
@@ -198,12 +218,12 @@ class TerminalCommandService
         }
     }
 
-    private function acquireConcurrencySlot(int $teamId, Server $server, int $timeout): LockContract
+    private function acquireConcurrencySlot(int $teamId, Server $server, int $timeout, int $connectionTimeout): LockContract
     {
         foreach (range(1, self::SERVER_CONCURRENCY_LIMIT) as $slot) {
             $lock = Cache::lock(
                 "terminal-api-exec:concurrent:team:{$teamId}:server:{$server->uuid}:{$slot}",
-                $this->concurrencyLeaseSeconds($timeout),
+                $this->concurrencyLeaseSeconds($timeout, $connectionTimeout),
             );
 
             if ($lock->get()) {
@@ -217,11 +237,15 @@ class TerminalCommandService
         );
     }
 
-    private function refreshConcurrencySlot(LockContract $lock, AuditEvent $auditEvent, int $timeout): void
-    {
+    private function refreshConcurrencySlot(
+        LockContract $lock,
+        AuditEvent $auditEvent,
+        int $timeout,
+        int $connectionTimeout,
+    ): void {
         try {
             $isOwned = $lock instanceof CacheLock && $lock->isOwnedByCurrentProcess();
-            $refreshed = $isOwned && $lock->refresh($this->concurrencyLeaseSeconds($timeout));
+            $refreshed = $isOwned && $lock->refresh($this->concurrencyLeaseSeconds($timeout, $connectionTimeout));
         } catch (Throwable $exception) {
             $isOwned = false;
             $refreshed = false;
@@ -242,6 +266,7 @@ class TerminalCommandService
             'stderr_bytes' => 0,
             'stdout_truncated' => false,
             'stderr_truncated' => false,
+            'timed_out' => false,
         ], 'unknown', [
             'remote_process_started' => false,
             'not_started_reason' => 'concurrency_lock_lost',
@@ -253,20 +278,50 @@ class TerminalCommandService
         );
     }
 
-    private function concurrencyLeaseSeconds(int $timeout): int
+    private function concurrencyLeaseSeconds(int $timeout, int $connectionTimeout): int
     {
-        return TerminalCommandProcessRunner::maximumSupervisionSeconds($timeout) + self::LOCK_LEASE_BUFFER_SECONDS;
+        return TerminalCommandProcessRunner::maximumSupervisionSeconds($timeout, $connectionTimeout)
+            + self::LOCK_LEASE_BUFFER_SECONDS;
     }
 
-    private function remoteCommand(Server $server, ?string $container, int $timeout): string
+    private function connectionTimeoutSeconds(Server $server): int
     {
-        $supervisedShell = "timeout -k 1s {$timeout}s sh -s";
+        return min(
+            self::MAX_CONNECTION_TIMEOUT_SECONDS,
+            max(1, SshMultiplexingHelper::getConnectionTimeout($server)),
+        );
+    }
+
+    /**
+     * @return array{string, string}
+     */
+    private function timeoutMarkers(): array
+    {
+        return [
+            '__COOLIFY_TERMINAL_TIMEOUT_'.bin2hex(random_bytes(32)).'__',
+            '__COOLIFY_TERMINAL_COMPLETE_'.bin2hex(random_bytes(32)).'__',
+        ];
+    }
+
+    private function remoteCommand(
+        Server $server,
+        ?string $container,
+        int $timeout,
+        string $timeoutMarker,
+        string $completionMarker,
+    ): string {
+        $killGrace = TerminalCommandProcessRunner::REMOTE_KILL_GRACE_SECONDS;
+        $controlledShell = 'sh -s; status=$?; printf "\\n%s\\n" "'.$completionMarker.'" >&2; exit "$status"';
+        $supervisedShell = 'timeout --preserve-status -k '.$killGrace.'s '.$timeout.'s sh -c '
+            .escapeshellarg($controlledShell).'; status=$?; '
+            .'case "$status" in 137|143) printf "\\n%s\\n" "'.$timeoutMarker.'" >&2;; esac; '
+            .'exit "$status"';
         if (is_null($container)) {
             return $supervisedShell;
         }
 
         return ($server->isNonRoot() ? 'sudo ' : '')
-            .'docker exec -i '.escapeshellarg($container).' '.$supervisedShell;
+            .'docker exec -i '.escapeshellarg($container).' sh -c '.escapeshellarg($supervisedShell);
     }
 
     private function beginAuditEvent(
@@ -330,7 +385,7 @@ class TerminalCommandService
     }
 
     /**
-     * @param  array{exit_code: int|null, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool}  $result
+     * @param  array{exit_code: int|null, duration_ms: int, stdout_bytes: int, stderr_bytes: int, stdout_truncated: bool, stderr_truncated: bool, timed_out: bool}  $result
      * @param  array<string, mixed>  $additionalMetadata
      */
     private function finishAuditEvent(AuditEvent $auditEvent, array $result, string $outcome, array $additionalMetadata = []): void
@@ -343,6 +398,7 @@ class TerminalCommandService
             'stderr_bytes' => $result['stderr_bytes'],
             'stdout_truncated' => $result['stdout_truncated'],
             'stderr_truncated' => $result['stderr_truncated'],
+            'timed_out' => $result['timed_out'],
             'finished_at' => now()->toIso8601String(),
         ], $additionalMetadata);
 

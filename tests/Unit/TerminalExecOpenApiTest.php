@@ -43,5 +43,10 @@ it('documents the bounded audited terminal exec contract for both targets', func
             'audit_event_id',
             'stdout_truncated',
             'stderr_truncated',
+            'timed_out',
         ]);
+
+    expect($openApi['components']['schemas']['TerminalCommandResult']['properties']['timed_out'])
+        ->type->toBe('boolean')
+        ->description->toContain('remote timeout supervisor marker', 'local SSH watchdog');
 });

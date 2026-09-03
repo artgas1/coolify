@@ -23358,7 +23358,8 @@
                     "duration_ms",
                     "audit_event_id",
                     "stdout_truncated",
-                    "stderr_truncated"
+                    "stderr_truncated",
+                    "timed_out"
                 ],
                 "properties": {
                     "exit_code": {
@@ -23381,6 +23382,10 @@
                         "type": "boolean"
                     },
                     "stderr_truncated": {
+                        "type": "boolean"
+                    },
+                    "timed_out": {
+                        "description": "True only when a remote timeout supervisor marker was observed without controlled-shell completion, or the bounded local SSH watchdog expired.",
                         "type": "boolean"
                     }
                 },

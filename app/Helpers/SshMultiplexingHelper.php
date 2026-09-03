@@ -255,7 +255,7 @@ class SshMultiplexingHelper
      *
      * @return array<int, string>
      */
-    public static function generateSshStdinCommand(Server $server, string $remoteCommand): array
+    public static function generateSshStdinCommand(Server $server, string $remoteCommand, ?int $connectionTimeout = null): array
     {
         if ($server->settings->force_disabled) {
             throw new \RuntimeException('Server is disabled.');
@@ -264,6 +264,7 @@ class SshMultiplexingHelper
         $sshConfig = self::serverSshConfiguration($server);
         $sshKeyLocation = $sshConfig['sshKeyLocation'];
         self::validateSshKey($server->privateKey);
+        $connectionTimeout ??= self::getConnectionTimeout($server);
 
         $sshCommand = [
             'ssh',
@@ -277,7 +278,7 @@ class SshMultiplexingHelper
             '-o',
             'PasswordAuthentication=no',
             '-o',
-            'ConnectTimeout='.self::getConnectionTimeout($server),
+            'ConnectTimeout='.$connectionTimeout,
             '-o',
             'ServerAliveInterval='.config('constants.ssh.server_interval'),
             '-o',
